@@ -102,6 +102,10 @@ app.post('/api/session', (req, res) => {
       answer: null,
     }));
 
+    // 恢复标识：随会话只保存在本机内存，前端存入本机 localStorage，
+    // 用于刷新/重开页面后找回未提交的会话；提交或删除后立即失效
+    const resumeToken = crypto.randomBytes(32).toString('hex');
+
     sessions.set(id, {
       id,
       dir: req.abxDir,
@@ -110,12 +114,13 @@ app.post('/api/session', (req, res) => {
       nameA: req.files.a[0].originalname,
       nameB: req.files.b[0].originalname,
       trials,
+      resumeToken,
       submitted: false,
       results: null,
       createdAt: Date.now(),
     });
 
-    res.json({ id, numTrials });
+    res.json({ id, numTrials, resumeToken });
   });
 });
 
@@ -141,6 +146,28 @@ app.get('/api/session/:id', (req, res) => {
     answers: s.trials.map((t) => t.answer),
     submitted: s.submitted,
     results: s.submitted ? s.results : undefined,
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 会话恢复（凭恢复标识找回未提交会话）
+// 只返回非敏感状态（题数、已选答案），绝不返回 X 映射与判分结果；
+// 提交或删除后恢复标识立即失效，过期会话由现有清理策略移除。
+// ---------------------------------------------------------------------------
+
+app.post('/api/session/:id/resume', (req, res) => {
+  const s = sessions.get(req.params.id);
+  if (!s) return res.status(404).json({ error: '会话不存在或已过期' });
+  const token = String((req.body && req.body.token) || '');
+  const expected = s.resumeToken || '';
+  const ok = expected.length > 0 &&
+    token.length === expected.length &&
+    crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expected));
+  if (!ok) return res.status(403).json({ error: '恢复标识无效或已失效' });
+  res.json({
+    id: s.id,
+    numTrials: s.trials.length,
+    answers: s.trials.map((t) => t.answer),
   });
 });
 
@@ -212,6 +239,7 @@ app.post('/api/session/:id/submit', (req, res) => {
     detail,
   };
   s.submitted = true;
+  s.resumeToken = null; // 提交后恢复标识立即失效
   res.json({ results: s.results });
 });
 

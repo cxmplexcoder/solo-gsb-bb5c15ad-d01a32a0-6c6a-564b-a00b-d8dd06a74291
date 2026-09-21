@@ -14,9 +14,10 @@ const $ = (sel) => document.querySelector(sel);
 // 全局状态
 // ---------------------------------------------------------------------------
 
-let session = null;          // { id, numTrials }
+let session = null;          // { id, numTrials, resumeToken }
 let answers = [];            // 每题 'A' | 'B' | null
 let currentTrial = 0;
+let pendingResume = null;    // 待恢复的会话快照 { id, token, numTrials, answers, currentTrial }
 
 let actx = null;             // AudioContext
 const buffers = { A: null, B: null, X: null };
@@ -36,6 +37,36 @@ let startOffset = 0;         // 本次播放起点对应的音频位置（秒）
 function show(viewId) {
   document.querySelectorAll('.view').forEach((v) => v.classList.add('hidden'));
   $('#' + viewId).classList.remove('hidden');
+}
+
+// ---------------------------------------------------------------------------
+// 可恢复会话（恢复标识只保存在本机浏览器的 localStorage 中）
+// ---------------------------------------------------------------------------
+
+const RESUME_KEY = 'abx.resume';
+
+function saveResume() {
+  if (!session || !session.resumeToken) return;
+  try {
+    localStorage.setItem(RESUME_KEY, JSON.stringify({
+      id: session.id,
+      token: session.resumeToken,
+      currentTrial,
+    }));
+  } catch (_) { /* localStorage 不可用时静默放弃恢复能力 */ }
+}
+
+function clearResume() {
+  try { localStorage.removeItem(RESUME_KEY); } catch (_) { /* 忽略 */ }
+}
+
+function readResume() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(RESUME_KEY) || 'null');
+    return saved && saved.id && saved.token ? saved : null;
+  } catch (_) {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +153,7 @@ async function fetchBuffer(url) {
 
 async function loadTrial(n) {
   currentTrial = n;
+  saveResume(); // 记录当前题号，刷新后可回到本题
   if (!xCache.has(n)) {
     xCache.set(n, await fetchBuffer(`/api/session/${session.id}/trial/${n}/x`));
   }
@@ -201,6 +233,29 @@ function tick() {
 // 事件绑定
 // ---------------------------------------------------------------------------
 
+/** 拉取 A/B 音频、初始化播放引擎并进入测试视图（新建与恢复共用） */
+async function enterTestView() {
+  // AudioContext 需在用户手势中创建
+  actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+  await actx.resume();
+
+  buffers.A = await fetchBuffer(`/api/session/${session.id}/audio/A`);
+  buffers.B = await fetchBuffer(`/api/session/${session.id}/audio/B`);
+  // 统一时间轴：以较短时长为准
+  timeline = Math.min(buffers.A.duration, buffers.B.duration);
+  $('#seek').max = timeline;
+
+  currentSrc = 'A';
+  playing = false;
+  startOffset = 0;
+  updateSrcButtons();
+  updatePlayBtn();
+  updateTransport();
+
+  await loadTrial(currentTrial);
+  show('view-test');
+}
+
 $('#btnStart').addEventListener('click', async () => {
   const errEl = $('#uploadError');
   errEl.textContent = '';
@@ -227,26 +282,11 @@ $('#btnStart').addEventListener('click', async () => {
     answers = Array(data.numTrials).fill(null);
     currentTrial = 0;
     xCache.clear();
+    saveResume(); // 保存恢复标识（仅存本机 localStorage）
+    $('#resumeBanner').classList.add('hidden');
+    pendingResume = null;
 
-    // AudioContext 需在用户手势中创建
-    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
-    await actx.resume();
-
-    buffers.A = await fetchBuffer(`/api/session/${session.id}/audio/A`);
-    buffers.B = await fetchBuffer(`/api/session/${session.id}/audio/B`);
-    // 统一时间轴：以较短时长为准
-    timeline = Math.min(buffers.A.duration, buffers.B.duration);
-    $('#seek').max = timeline;
-
-    currentSrc = 'A';
-    playing = false;
-    startOffset = 0;
-    updateSrcButtons();
-    updatePlayBtn();
-    updateTransport();
-
-    await loadTrial(0);
-    show('view-test');
+    await enterTestView();
   } catch (e) {
     errEl.textContent = e.message;
   } finally {
@@ -296,6 +336,7 @@ $('#btnSubmit').addEventListener('click', async () => {
     return;
   }
   pause();
+  clearResume(); // 提交后恢复标识已在服务端失效，本地一并清除
   showResults(data.results);
 });
 
@@ -307,6 +348,7 @@ $('#btnAgain').addEventListener('click', async () => {
   session = null;
   answers = [];
   xCache.clear();
+  clearResume();
   buffers.A = buffers.B = buffers.X = null;
   currentSrc = 'A';
   startOffset = 0;
@@ -337,5 +379,75 @@ function showResults(results) {
   show('view-result');
 }
 
+// ---------------------------------------------------------------------------
+// 页面加载：检测未提交的会话，提供「继续上次测试」入口
+// ---------------------------------------------------------------------------
+
+async function initResume() {
+  const saved = readResume();
+  if (!saved) return;
+  try {
+    const res = await fetch(`/api/session/${saved.id}/resume`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: saved.token }),
+    });
+    if (!res.ok) {
+      clearResume(); // 会话已提交 / 删除 / 过期，恢复标识随之作废
+      return;
+    }
+    const data = await res.json();
+    pendingResume = {
+      id: data.id,
+      token: saved.token,
+      numTrials: data.numTrials,
+      answers: data.answers,
+      currentTrial: Math.min(Math.max(0, saved.currentTrial | 0), data.numTrials - 1),
+    };
+    const done = data.answers.filter(Boolean).length;
+    $('#resumeInfo').textContent =
+      `检测到未完成的测试：共 ${data.numTrials} 题，已答 ${done} 题。`;
+    $('#resumeBanner').classList.remove('hidden');
+  } catch (_) {
+    // 服务不可达等异常：保留本地标识，下次打开再试
+  }
+}
+
+$('#btnResume').addEventListener('click', async () => {
+  if (!pendingResume) return;
+  const btn = $('#btnResume');
+  btn.disabled = true;
+  btn.textContent = '恢复中…';
+  try {
+    session = {
+      id: pendingResume.id,
+      numTrials: pendingResume.numTrials,
+      resumeToken: pendingResume.token,
+    };
+    answers = pendingResume.answers.slice();
+    currentTrial = pendingResume.currentTrial;
+    xCache.clear();
+    $('#resumeBanner').classList.add('hidden');
+    await enterTestView();
+    pendingResume = null;
+  } catch (e) {
+    alert(e.message || '恢复失败，请重试');
+    $('#resumeBanner').classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '继续上次测试';
+  }
+});
+
+$('#btnDiscard').addEventListener('click', async () => {
+  if (pendingResume) {
+    await fetch(`/api/session/${pendingResume.id}`, { method: 'DELETE' }).catch(() => {});
+  }
+  pendingResume = null;
+  clearResume();
+  $('#resumeBanner').classList.add('hidden');
+});
+
 // 启动 UI 刷新循环
 tick();
+initResume();

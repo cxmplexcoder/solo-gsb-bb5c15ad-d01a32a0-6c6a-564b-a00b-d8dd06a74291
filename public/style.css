@@ -65,6 +65,26 @@ main {
   font-size: 0.95rem;
 }
 
+/* 恢复会话横幅 */
+.resume-banner {
+  background: rgba(79, 140, 255, 0.1);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 0.8rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.resume-banner p { margin: 0; font-size: 0.9rem; }
+
+.resume-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.resume-actions button { flex: 1; }
+
 input[type="file"],
 input[type="number"] {
   background: var(--bg);
