@@ -14,9 +14,36 @@ const $ = (sel) => document.querySelector(sel);
 // 全局状态
 // ---------------------------------------------------------------------------
 
-let session = null;          // { id, numTrials }
+let session = null;          // { id, numTrials, recoveryToken }
 let answers = [];            // 每题 'A' | 'B' | null
 let currentTrial = 0;
+
+// ---------------------------------------------------------------------------
+// 恢复标识（仅存本机浏览器 localStorage，不会离开本机）
+// ---------------------------------------------------------------------------
+
+const RECOVERY_KEY = 'abx.recovery';
+let pendingResume = null;    // 页面加载时探测到的可恢复会话
+
+function saveRecovery() {
+  if (!session || !session.recoveryToken) return;
+  localStorage.setItem(RECOVERY_KEY, JSON.stringify({
+    token: session.recoveryToken,
+    trial: currentTrial,
+  }));
+}
+
+function loadSavedRecovery() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(RECOVERY_KEY));
+    if (saved && typeof saved.token === 'string') return saved;
+  } catch (_) { /* 忽略损坏的本地数据 */ }
+  return null;
+}
+
+function clearRecovery() {
+  localStorage.removeItem(RECOVERY_KEY);
+}
 
 let actx = null;             // AudioContext
 const buffers = { A: null, B: null, X: null };
@@ -122,6 +149,7 @@ async function fetchBuffer(url) {
 
 async function loadTrial(n) {
   currentTrial = n;
+  saveRecovery(); // 记住当前题号，刷新后可回到本题
   if (!xCache.has(n)) {
     xCache.set(n, await fetchBuffer(`/api/session/${session.id}/trial/${n}/x`));
   }
@@ -201,6 +229,29 @@ function tick() {
 // 事件绑定
 // ---------------------------------------------------------------------------
 
+/** 进入测试视图：解码 A/B、初始化播放状态并加载当前题（新建与恢复共用） */
+async function enterTest() {
+  // AudioContext 需在用户手势中创建
+  actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+  await actx.resume();
+
+  buffers.A = await fetchBuffer(`/api/session/${session.id}/audio/A`);
+  buffers.B = await fetchBuffer(`/api/session/${session.id}/audio/B`);
+  // 统一时间轴：以较短时长为准
+  timeline = Math.min(buffers.A.duration, buffers.B.duration);
+  $('#seek').max = timeline;
+
+  currentSrc = 'A';
+  playing = false;
+  startOffset = 0;
+  updateSrcButtons();
+  updatePlayBtn();
+  updateTransport();
+
+  await loadTrial(currentTrial);
+  show('view-test');
+}
+
 $('#btnStart').addEventListener('click', async () => {
   const errEl = $('#uploadError');
   errEl.textContent = '';
@@ -215,6 +266,13 @@ $('#btnStart').addEventListener('click', async () => {
   btn.disabled = true;
   btn.textContent = '上传并解码中…';
   try {
+    // 开始新测试即放弃旧的待恢复会话（主动删除，恢复标识随之失效）
+    if (pendingResume) {
+      await fetch(`/api/session/${pendingResume.id}`, { method: 'DELETE' }).catch(() => {});
+      pendingResume = null;
+      $('#view-resume').classList.add('hidden');
+    }
+
     const fd = new FormData();
     fd.append('a', fa);
     fd.append('b', fb);
@@ -227,32 +285,79 @@ $('#btnStart').addEventListener('click', async () => {
     answers = Array(data.numTrials).fill(null);
     currentTrial = 0;
     xCache.clear();
+    saveRecovery(); // 保存恢复标识，刷新/重开页面可找回本会话
 
-    // AudioContext 需在用户手势中创建
-    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
-    await actx.resume();
-
-    buffers.A = await fetchBuffer(`/api/session/${session.id}/audio/A`);
-    buffers.B = await fetchBuffer(`/api/session/${session.id}/audio/B`);
-    // 统一时间轴：以较短时长为准
-    timeline = Math.min(buffers.A.duration, buffers.B.duration);
-    $('#seek').max = timeline;
-
-    currentSrc = 'A';
-    playing = false;
-    startOffset = 0;
-    updateSrcButtons();
-    updatePlayBtn();
-    updateTransport();
-
-    await loadTrial(0);
-    show('view-test');
+    await enterTest();
   } catch (e) {
     errEl.textContent = e.message;
   } finally {
     btn.disabled = false;
     btn.textContent = '开始测试';
   }
+});
+
+// ---------------------------------------------------------------------------
+// 会话恢复（刷新 / 重新打开页面后找回未提交的测试）
+// ---------------------------------------------------------------------------
+
+async function initRecovery() {
+  const saved = loadSavedRecovery();
+  if (!saved) return;
+  try {
+    const res = await fetch('/api/session/recover', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: saved.token }),
+    });
+    if (!res.ok) throw new Error('recover failed');
+    const data = await res.json();
+    pendingResume = {
+      ...data,
+      token: saved.token,
+      trial: Math.min(Math.max(0, saved.trial | 0), data.numTrials - 1),
+    };
+    const answered = data.answers.filter(Boolean).length;
+    $('#resumeInfo').textContent =
+      `检测到本机有未提交的测试：共 ${data.numTrials} 题，已答 ${answered} 题，` +
+      `上次进行到第 ${pendingResume.trial + 1} 题。`;
+    $('#view-resume').classList.remove('hidden');
+  } catch (_) {
+    clearRecovery(); // 会话已提交、删除或过期，恢复标识不再有效
+  }
+}
+
+$('#btnResume').addEventListener('click', async () => {
+  if (!pendingResume) return;
+  const btn = $('#btnResume');
+  btn.disabled = true;
+  btn.textContent = '正在恢复…';
+  const resume = pendingResume;
+  try {
+    session = {
+      id: resume.id,
+      numTrials: resume.numTrials,
+      recoveryToken: resume.token,
+    };
+    answers = resume.answers.slice();
+    currentTrial = resume.trial;
+    xCache.clear();
+    await enterTest();
+    pendingResume = null;
+    $('#view-resume').classList.add('hidden');
+  } catch (e) {
+    alert(e.message || '恢复失败');
+    btn.disabled = false;
+    btn.textContent = '继续上次测试';
+  }
+});
+
+$('#btnDiscardResume').addEventListener('click', async () => {
+  if (pendingResume) {
+    await fetch(`/api/session/${pendingResume.id}`, { method: 'DELETE' }).catch(() => {});
+  }
+  pendingResume = null;
+  clearRecovery();
+  $('#view-resume').classList.add('hidden');
 });
 
 $('#btnPlay').addEventListener('click', async () => {
@@ -296,6 +401,7 @@ $('#btnSubmit').addEventListener('click', async () => {
     return;
   }
   pause();
+  clearRecovery(); // 提交后恢复标识立即失效（服务端同步作废）
   showResults(data.results);
 });
 
@@ -307,6 +413,7 @@ $('#btnAgain').addEventListener('click', async () => {
   session = null;
   answers = [];
   xCache.clear();
+  clearRecovery();
   buffers.A = buffers.B = buffers.X = null;
   currentSrc = 'A';
   startOffset = 0;
@@ -337,5 +444,6 @@ function showResults(results) {
   show('view-result');
 }
 
-// 启动 UI 刷新循环
+// 启动 UI 刷新循环，并探测本机是否有可恢复的未提交会话
 tick();
+initRecovery();

@@ -15,6 +15,17 @@
   <main>
     <!-- 视图 1：上传 -->
     <section id="view-upload" class="view">
+      <!-- 可恢复会话提示（仅当本机存在未提交会话时显示） -->
+      <div id="view-resume" class="card resume-card hidden">
+        <h2>继续上次测试</h2>
+        <p id="resumeInfo" class="hint"></p>
+        <div class="resume-actions">
+          <button id="btnResume" class="primary">继续上次测试</button>
+          <button id="btnDiscardResume">放弃并删除该会话</button>
+        </div>
+        <p class="hint">恢复标识仅保存在本机浏览器中；提交或删除后立即失效。</p>
+      </div>
+
       <div class="card">
         <h2>上传音频</h2>
         <p class="hint">请选择两个<strong>同格式</strong>的音频文件（如两个 WAV）。统一时间轴以较短的一个为准。</p>

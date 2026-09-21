@@ -32,6 +32,21 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 /** 会话仅保存在本机内存：id -> session */
 const sessions = new Map();
 
+/** 恢复标识（仅存 SHA-256 哈希）：tokenHash -> sessionId，提交/删除/过期即移除 */
+const recoveryTokens = new Map();
+
+function hashToken(token) {
+  return crypto.createHash('sha256').update(String(token)).digest('hex');
+}
+
+/** 使会话的恢复标识立即失效（提交、删除、过期时调用） */
+function dropRecoveryToken(s) {
+  if (s && s.tokenHash) {
+    recoveryTokens.delete(s.tokenHash);
+    s.tokenHash = null;
+  }
+}
+
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -102,6 +117,10 @@ app.post('/api/session', (req, res) => {
       answer: null,
     }));
 
+    // 恢复标识：高熵随机 token，仅哈希存内存，明文只下发给本机浏览器一次
+    const recoveryToken = crypto.randomBytes(32).toString('base64url');
+    const tokenHash = hashToken(recoveryToken);
+
     sessions.set(id, {
       id,
       dir: req.abxDir,
@@ -113,9 +132,11 @@ app.post('/api/session', (req, res) => {
       submitted: false,
       results: null,
       createdAt: Date.now(),
+      tokenHash,
     });
+    recoveryTokens.set(tokenHash, id);
 
-    res.json({ id, numTrials });
+    res.json({ id, numTrials, recoveryToken });
   });
 });
 
@@ -141,6 +162,22 @@ app.get('/api/session/:id', (req, res) => {
     answers: s.trials.map((t) => t.answer),
     submitted: s.submitted,
     results: s.submitted ? s.results : undefined,
+  });
+});
+
+// 会话恢复：凭恢复标识找回未提交会话的非敏感状态。
+// 只返回题数与已选答案，绝不包含 X 映射；已提交/删除/过期的会话一律 404。
+app.post('/api/session/recover', (req, res) => {
+  const token = req.body && typeof req.body.token === 'string' ? req.body.token : '';
+  const s = token ? sessions.get(recoveryTokens.get(hashToken(token))) : null;
+  if (!s || s.submitted) {
+    return res.status(404).json({ error: '没有可恢复的会话（可能已提交、删除或过期）' });
+  }
+  res.json({
+    id: s.id,
+    numTrials: s.trials.length,
+    answers: s.trials.map((t) => t.answer),
+    submitted: false,
   });
 });
 
@@ -212,12 +249,14 @@ app.post('/api/session/:id/submit', (req, res) => {
     detail,
   };
   s.submitted = true;
+  dropRecoveryToken(s); // 提交后恢复标识立即失效
   res.json({ results: s.results });
 });
 
 app.delete('/api/session/:id', (req, res) => {
   const s = sessions.get(req.params.id);
   if (s) {
+    dropRecoveryToken(s);
     sessions.delete(s.id);
     removeDir(s.dir);
   }
@@ -232,6 +271,7 @@ setInterval(() => {
   const now = Date.now();
   for (const s of sessions.values()) {
     if (now - s.createdAt > SESSION_TTL_MS) {
+      dropRecoveryToken(s);
       sessions.delete(s.id);
       removeDir(s.dir);
     }
